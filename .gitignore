@@ -1,0 +1,8 @@
+# Zephyr build output
+/build/
+
+# Companion (uv) environment + cached feed
+companion/.venv/
+companion/gtfs.zip
+__pycache__/
+*.pyc

@@ -1,0 +1,140 @@
+/*
+ * Elron train display — Seeed XIAO nRF52840 + ST7789V 240x240 over SPI3.
+ * Wiring mirrors the user's prospector_adapter overlay (direct-SPI st7789v binding,
+ * which is valid on Zephyr 3.6 / NCS v2.7.0).
+ *
+ *   SPI3 SCK  P0.05    MOSI P0.04    MISO P1.10
+ *   CS  xiao_d 9   DC  xiao_d 7   RESET xiao_d 3   (all active-low)
+ *   Backlight PWM_OUT0 P1.11
+ */
+
+#include <zephyr/dt-bindings/gpio/gpio.h>
+#include <zephyr/dt-bindings/adc/adc.h>
+#include <zephyr/dt-bindings/adc/nrf-adc.h>
+
+/ {
+	chosen {
+		zephyr,display = &st7789v;
+		zephyr,console = &cdc_acm_uart0;
+	};
+
+	/* Backlight is a plain active-high GPIO on P1.11 (gpio1 pin 11),
+	 * driven directly in main.c. No dimming for v1. */
+};
+
+&pinctrl {
+	spi3_default: spi3_default {
+		group1 {
+			psels = <NRF_PSEL(SPIM_SCK, 0, 5)>,
+				<NRF_PSEL(SPIM_MOSI, 0, 4)>,
+				<NRF_PSEL(SPIM_MISO, 1, 10)>;
+		};
+	};
+
+	spi3_sleep: spi3_sleep {
+		group1 {
+			psels = <NRF_PSEL(SPIM_SCK, 0, 5)>,
+				<NRF_PSEL(SPIM_MOSI, 0, 4)>,
+				<NRF_PSEL(SPIM_MISO, 1, 10)>;
+			low-power-enable;
+		};
+	};
+};
+
+&spi3 {
+	status = "okay";
+	pinctrl-0 = <&spi3_default>;
+	pinctrl-1 = <&spi3_sleep>;
+	pinctrl-names = "default", "sleep";
+	cs-gpios = <&gpio1 14 GPIO_ACTIVE_LOW>;   /* xiao_d 9  = P1.14 */
+
+	st7789v: st7789v@0 {
+		compatible = "sitronix,st7789v";
+		reg = <0>;
+		spi-max-frequency = <31000000>;
+		cmd-data-gpios = <&gpio1 12 GPIO_ACTIVE_LOW>; /* xiao_d 7 = P1.12 */
+		reset-gpios = <&gpio0 29 GPIO_ACTIVE_LOW>;    /* xiao_d 3 = P0.29 */
+
+		width = <240>;
+		height = <240>;
+		x-offset = <0>;
+		y-offset = <0>;
+
+		vcom = <0x19>;
+		gctrl = <0x35>;
+		vrhs = <0x12>;
+		vdvs = <0x20>;
+		mdac = <0x00>;   /* native orientation; rotation done in LVGL (sw) */
+		gamma = <0x01>;
+		colmod = <0x05>;
+		lcm = <0x2c>;
+		porch-param = [0c 0c 00 33 33];
+		cmd2en-param = [5a 69 02 01];
+		pwctrl1-param = [a4 a1];
+		pvgam-param = [D0 04 0D 11 13 2B 3F 54 4C 18 0D 0B 1F 23];
+		nvgam-param = [D0 04 0C 11 13 2C 3F 44 51 2F 1F 1F 20 23];
+		ram-param = [00 F0];
+		rgb-param = [CD 08 14];
+	};
+};
+
+&zephyr_udc0 {
+	/* uart0 = log console (chosen zephyr,console). */
+	cdc_acm_uart0: cdc_acm_uart0 {
+		compatible = "zephyr,cdc-acm-uart";
+	};
+	/* uart1 = dedicated data channel for the host->board schedule push.
+	 * Separate port so the IRQ reader doesn't clobber the console's handler. */
+	cdc_acm_uart1: cdc_acm_uart1 {
+		compatible = "zephyr,cdc-acm-uart";
+	};
+};
+
+/* The xiao_ble board DTS adds its own CDC ACM (shell/mcumgr/bt-mon, all unused
+ * here). Leaving it on enumerates a stray third COM port and shifts our data
+ * port's interface number. Disable it so the board exposes exactly two ports:
+ * MI_00 = cdc_acm_uart0 (console), MI_02 = cdc_acm_uart1 (data). */
+&usb_cdc_acm_uart {
+	status = "disabled";
+};
+
+/*
+ * Free the display pins that the xiao_ble board enables by default:
+ *   i2c1  -> P0.04 (SPI MOSI) + P0.05 (SPI SCK)
+ *   spi2  -> P1.14 (display CS = xiao_d 9)
+ *   uart0 -> P1.11 (backlight) + P1.12 (display DC = xiao_d 7)
+ * (ZMK's board doesn't enable these, so the prospector overlay never had to.)
+ */
+&i2c1 {
+	status = "disabled";
+};
+
+&spi2 {
+	status = "disabled";
+};
+
+&uart0 {
+	status = "disabled";
+};
+
+/* Battery sense: VBAT divided onto AIN7 (P0.31), enabled by pulling P0.14 low. */
+/ {
+	zephyr,user {
+		io-channels = <&adc 7>;
+	};
+};
+
+&adc {
+	status = "okay";
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	channel@7 {
+		reg = <7>;
+		zephyr,gain = "ADC_GAIN_1_6";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+		zephyr,input-positive = <NRF_SAADC_AIN7>;
+		zephyr,resolution = <12>;
+	};
+};

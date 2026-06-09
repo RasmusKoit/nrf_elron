@@ -1,0 +1,18 @@
+[project]
+name = "elron-companion"
+version = "0.1.0"
+description = "Fetch live Elron departures and push them to the nRF52840 display over USB/BLE"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "bleak>=0.22",     # cross-platform BLE (WinRT / BlueZ / CoreBluetooth)
+    "requests>=2.31",  # Ridango HTTP API
+    "tzdata>=2024.1",  # IANA tz data (Windows has no system tz database)
+    "pyserial>=3.5",   # USB CDC data port (COMx / /dev/ttyACM*)
+]
+
+[project.urls]
+Repository = "https://github.com/RasmusKoit/nrf_elron"
+
+[tool.uv]
+package = false

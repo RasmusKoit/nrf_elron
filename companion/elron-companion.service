@@ -1,0 +1,28 @@
+# Linux autostart for the Elron companion (systemd *user* service).
+# Equivalent of elron-service.vbs on Windows: keeps `--serve` running so the
+# board re-syncs whenever it appears on USB or BLE.
+#
+# Install (adjust WorkingDirectory / the uv path to match your setup):
+#   mkdir -p ~/.config/systemd/user
+#   cp elron-companion.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now elron-companion.service
+#   loginctl enable-linger "$USER"      # so it runs even when not logged in
+#
+# Check it:  systemctl --user status elron-companion   |   journalctl --user -u elron-companion -f
+
+[Unit]
+Description=Elron display companion — push live departures to the BLE board
+After=bluetooth.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/nrf_elron/companion
+# `which uv` to find yours; the standalone installer puts it in ~/.local/bin.
+ExecStart=%h/.local/bin/uv run elron_push.py --serve
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
