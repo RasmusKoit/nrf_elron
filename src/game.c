@@ -3,6 +3,7 @@
 
 #include <lvgl.h>
 #include <zephyr/kernel.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/settings/settings.h>
 #include <zephyr/logging/log.h>
 #include <errno.h>
@@ -65,6 +66,14 @@ static int         next_gap;
 static int         train_phase;
 static int64_t     over_ms;
 static uint32_t    rng;
+
+/* Enter/press requests arrive on the debounce workqueue thread, but LVGL is not
+ * thread-safe — driving it there races the main loop's lv_task_handler() and was
+ * dropping the game's full-screen invalidate, leaving stale schedule pixels
+ * behind the game. So elron_game_enter()/_button() only record intent here, and
+ * elron_game_tick() (main-loop thread) applies it next to its own LVGL calls. */
+static atomic_t enter_req;
+K_MSGQ_DEFINE(btn_msgq, sizeof(uint8_t), 8, 1);
 
 /* ── High score persistence (own "game" settings subtree) ─────────────────── */
 static int game_set_cb(const char *name, size_t len,
@@ -272,32 +281,26 @@ bool elron_game_active(void)
 
 void elron_game_enter(void)
 {
+	/* Workqueue context: flag the request, do NOT touch LVGL. The main loop
+	 * sees active and applies the screen switch in elron_game_tick(). */
 	active = true;
-	set_state(G_TITLE);
-	lv_scr_load(scr);
-	/* Partial render buffer (LV_Z_VDB_SIZE=14%): the screen repaints in chunks,
-	 * and switching screens can leave stale panel pixels (e.g. the schedule's
-	 * "Waiting for sync") in chunks the game doesn't draw over. Force every chunk
-	 * dirty so the whole panel is repainted — same trick main.c uses after
-	 * un-blanking. */
-	lv_obj_invalidate(scr);
-	LOG_INF("game: enter");
+	atomic_set(&enter_req, 1);
 }
 
 static void game_exit(void)
 {
 	active = false;
+	k_msgq_purge(&btn_msgq);                 /* drop presses queued before exit */
 	lv_scr_load(elron_ui_screen());
-	lv_obj_invalidate(elron_ui_screen());   /* repaint every chunk (see enter) */
+	lv_obj_invalidate(elron_ui_screen());    /* repaint every chunk (see tick) */
 	elron_ui_refresh(false);
 	LOG_INF("game: exit");
 }
 
-void elron_game_button(uint8_t idx, bool pressed)
+/* Apply one queued button press. Runs on the main-loop thread (drained by
+ * elron_game_tick), so it's safe to call LVGL from here. */
+static void handle_button(uint8_t idx)
 {
-	if (!active || !pressed) {
-		return;
-	}
 	if (idx == 1) {            /* #2 = BACK, always exits */
 		game_exit();
 		return;
@@ -319,11 +322,39 @@ void elron_game_button(uint8_t idx, bool pressed)
 	}
 }
 
+void elron_game_button(uint8_t idx, bool pressed)
+{
+	/* Workqueue context: just queue the press; the main loop applies it. */
+	if (!active || !pressed) {
+		return;
+	}
+	(void)k_msgq_put(&btn_msgq, &idx, K_NO_WAIT);
+}
+
 void elron_game_tick(void)
 {
 	if (!active) {
 		return;
 	}
+
+	/* Apply a pending enter here so the screen switch + full-screen invalidate
+	 * happen on this (main-loop) thread, just before lv_task_handler() runs —
+	 * not racing it from the button workqueue. The partial render buffer
+	 * (LV_Z_VDB_SIZE=14%) repaints in chunks, so a dropped invalidate would
+	 * leave stale schedule pixels in chunks the game never redraws over. */
+	if (atomic_cas(&enter_req, 1, 0)) {
+		set_state(G_TITLE);
+		lv_scr_load(scr);
+		lv_obj_invalidate(scr);
+		LOG_INF("game: enter");
+	}
+
+	/* Drain queued presses (also this thread, so LVGL stays single-threaded). */
+	uint8_t idx;
+	while (active && k_msgq_get(&btn_msgq, &idx, K_NO_WAIT) == 0) {
+		handle_button(idx);
+	}
+
 	if (state == G_PLAYING) {
 		update();
 		if (state == G_PLAYING) {   /* update() may have ended the run */
