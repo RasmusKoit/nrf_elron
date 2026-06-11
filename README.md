@@ -6,6 +6,8 @@ configurable) — specifically **when to start walking** to catch one. A compani
 (Windows/Linux/macOS) fetches a week of live times and pushes them over USB or BLE;
 the board persists them to flash and runs offline on battery.
 
+![Elron train display in action](docs/demo.gif)
+
 ```
   ┌─────────────────────────┐
   │ Tallinn-Väike → Kohila  │   ← Elron-orange title bar
@@ -25,6 +27,8 @@ the board persists them to flash and runs offline on battery.
 - `prj.conf`, `CMakeLists.txt`, `src/` — the Zephyr/NCS firmware.
 - `src/buttons.c` — three front-panel buttons (debounced); one is a staged
   hold-to-reset / hold-longer-for-bootloader. See [Buttons](#buttons).
+- `src/game.c` — "Catch the Train", a hidden one-button endless runner reachable
+  with the #1+#2 chord. See [Buttons](#buttons).
 - `companion/` — the cross-platform `uv` app (`elron_push.py`) that fetches live
   data and pushes it over USB/BLE. See `companion/README.md`.
 - `build.sh` — builds (NCS v2.7.0) and flashes hands-free over BLE.
@@ -100,7 +104,11 @@ on D8 (the firmware drives it low; inputs use internal pull-ups), debounced in
 
   Thresholds live in `src/main.c` (`BTN3_RESET_MS` / `BTN3_BOOT_MS` /
   `BTN3_CANCEL_MS`).
-- **Two spare buttons** — wired and debounced, no action assigned yet.
+- **Buttons #1 and #2** — normally unused on the schedule view; **hold both at
+  once** to launch the hidden game, *"Catch the Train"* (a one-button endless
+  runner, `src/game.c`). In the game, **#1 = GO** (start / jump / replay) and
+  **#2 = BACK** (quit to the schedule). The high score persists in NVS; the
+  game-over screen auto-exits after 20 s.
 
 ## How it works
 

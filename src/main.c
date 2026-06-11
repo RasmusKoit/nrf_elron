@@ -3,6 +3,7 @@
 #include "ui.h"
 #include "battery.h"
 #include "buttons.h"
+#include "game.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
@@ -337,8 +338,19 @@ static void btn_cb(uint8_t idx, bool pressed)
 		}
 		return;
 	}
+
+	/* #1 / #2: in-game controls, or the entry chord from the schedule view. */
+	if (elron_game_active()) {
+		elron_game_button(idx, pressed);
+		return;
+	}
 	if (pressed) {
-		LOG_INF("button #%u (%s) pressed", idx + 1, elron_button_name[idx]);
+		uint32_t st = elron_buttons_state();
+		if ((st & BIT(0)) && (st & BIT(1))) {   /* #1 + #2 held -> launch */
+			elron_game_enter();
+		} else {
+			LOG_INF("button #%u (%s) pressed", idx + 1, elron_button_name[idx]);
+		}
 	}
 }
 #endif
@@ -584,6 +596,7 @@ int main(void)
 
 	elron_ui_init();
 	elron_ui_refresh(false);
+	elron_game_init();
 
 	if (elron_ble_init(on_ble_rx)) {
 		LOG_ERR("ble init failed");
@@ -603,6 +616,25 @@ int main(void)
 		elron_ui_button_hint(btn3_hint);
 		if (btn3_held) {
 			backlight_set(true);   /* make the hint visible even if it's dark */
+		}
+
+		/* Game mode takes over the loop: tick ~30 fps, keep the screen lit,
+		 * and skip the schedule refresh until the player exits. */
+		if (elron_game_active()) {
+			if (!screen_on_state) {
+				display_blanking_off(display_dev);
+				screen_on_state = true;
+			}
+			backlight_set(true);
+			elron_game_tick();
+			lv_task_handler();
+			int64_t gnow = k_uptime_get();
+			if (gnow - last_tick >= 1000) {
+				last_tick = gnow;
+				battery_charge_manage();
+			}
+			k_sleep(K_MSEC(33));
+			continue;
 		}
 #endif
 		lv_task_handler();

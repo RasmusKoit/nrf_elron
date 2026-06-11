@@ -21,6 +21,7 @@ static lv_obj_t *lbl_train;     /* which train: HH:MM -> dest */
 static lv_obj_t *lbl_then;      /* following departures */
 static lv_obj_t *lbl_status;
 static lv_obj_t *lbl_hint;       /* hold-to-reset/bootloader overlay */
+static lv_obj_t *sched_scr;      /* the schedule screen (for the game to return to) */
 
 static void style_label(lv_obj_t *l, const lv_font_t *font, lv_color_t color)
 {
@@ -48,6 +49,7 @@ void elron_ui_init(void)
 	}
 
 	lv_obj_t *scr = lv_scr_act();
+	sched_scr = scr;
 	lv_obj_set_style_bg_color(scr, COL_BG, 0);
 	lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 	lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
@@ -87,6 +89,11 @@ void elron_ui_init(void)
 	lv_obj_align(lbl_hint, LV_ALIGN_CENTER, 0, 0);
 	lv_label_set_text(lbl_hint, "");
 	lv_obj_add_flag(lbl_hint, LV_OBJ_FLAG_HIDDEN);
+}
+
+lv_obj_t *elron_ui_screen(void)
+{
+	return sched_scr;
 }
 
 void elron_ui_button_hint(int state)

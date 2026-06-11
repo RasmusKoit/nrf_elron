@@ -11,6 +11,7 @@ target_sources(app PRIVATE
   src/ui.c
   src/battery.c
   src/buttons.c
+  src/game.c
 )
 
 target_include_directories(app PRIVATE src)
