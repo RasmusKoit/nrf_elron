@@ -2,6 +2,7 @@
 #include "ble_svc.h"
 #include "ui.h"
 #include "battery.h"
+#include "buttons.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
@@ -21,10 +22,23 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 /* Set to 1 to run ONLY a full-screen colour-cycle panel test (no LVGL/BLE). */
 #define PANEL_TEST 0
 
+/* Set to 1 to run ONLY the button wiring/debounce test: shows live press state
+ * and a per-button counter on screen (no schedule UI/BLE). Flip back to 0 once
+ * the three buttons are confirmed. */
+#define BUTTON_TEST 0
+
+/* Set to 1 to run ONLY the wiring scanner: sweeps every free header pin as a
+ * driven-low common while reading the others, and prints which pins short
+ * together when you hold each button — so it self-discovers the wiring. */
+#define BUTTON_DISCOVER 0
+
 static const struct device *display_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_display));
 /* Backlight: active-high GPIO P1.11 (gpio1 pin 11). */
 static const struct device *gpio1_dev = DEVICE_DT_GET(DT_NODELABEL(gpio1));
 #define BACKLIGHT_PIN 11
+#if BUTTON_DISCOVER
+static const struct device *gpio0_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
+#endif
 
 /* Second CDC ACM port, dedicated to the host->board data push (separate from the
  * log console so its IRQ reader doesn't clobber the console's own handler). */
@@ -239,6 +253,229 @@ static bool screen_update(void)
 	return on;
 }
 
+/* ── Buttons (D0/D1/D2, common D8) ──────────────────────────────────────────
+ * For now the three buttons have no assigned function — this just confirms the
+ * wiring + debounce work. Normal mode logs each press; BUTTON_TEST shows it on
+ * screen. We'll wire real actions in once we decide what they should do. */
+#if BUTTON_TEST
+static volatile uint32_t btn_press_cnt[ELRON_NUM_BUTTONS];
+
+static void btn_test_cb(uint8_t idx, bool pressed)
+{
+	if (pressed && idx < ELRON_NUM_BUTTONS) {
+		btn_press_cnt[idx]++;
+	}
+	LOG_INF("BTN D%u %s", idx, pressed ? "DOWN" : "up");
+}
+#else
+/* Physical buttons: #1 (D1) and #2 (D2) are unassigned for now. #3 (D0) is a
+ * deliberately-staged hold (it's a sensitive button, so a tap does nothing):
+ *   hold >= 3s, release < 6s  -> reset (clean reboot; also re-triggers a
+ *                                companion resync since the clock is RAM-only)
+ *   hold >= 6s, release < 10s -> enter the UF2 bootloader (GPREGRET 0x57)
+ *   hold >= 10s               -> timer exits, nothing happens (escape hatch)
+ *   release < 3s              -> nothing
+ * A poll timer runs while it's held: it advances the on-screen hint and trips
+ * the 10s cancel. The action itself is chosen from the hold duration on release. */
+#define BTN3_RESET_MS   3000
+#define BTN3_BOOT_MS    6000
+#define BTN3_CANCEL_MS  10000
+
+static struct k_work_delayable btn3_poll_work;
+static volatile int64_t btn3_press_ms;
+static volatile bool    btn3_held;
+static volatile int     btn3_hint;   /* feeds elron_ui_button_hint() from main loop */
+
+static void btn3_poll_fn(struct k_work *w)
+{
+	ARG_UNUSED(w);
+	if (!btn3_held) {
+		return;
+	}
+	int64_t held = k_uptime_get() - btn3_press_ms;
+	if (held >= BTN3_CANCEL_MS) {
+		btn3_hint = 4;            /* "Cancelled" — release now does nothing */
+		return;                  /* stop polling: escape hatch tripped */
+	} else if (held >= BTN3_BOOT_MS) {
+		btn3_hint = 3;           /* bootloader armed */
+	} else if (held >= BTN3_RESET_MS) {
+		btn3_hint = 2;           /* reset armed; keep holding for bootloader */
+	} else {
+		btn3_hint = 1;           /* "Hold 3s for reset" */
+	}
+	k_work_reschedule(&btn3_poll_work, K_MSEC(100));
+}
+
+static void btn_cb(uint8_t idx, bool pressed)
+{
+	if (idx == 2) {   /* #3 = staged hold: reset / bootloader / cancel */
+		if (pressed) {
+			btn3_press_ms = k_uptime_get();
+			btn3_held = true;
+			btn3_hint = 1;
+			k_work_reschedule(&btn3_poll_work, K_NO_WAIT);
+			return;
+		}
+		/* Released: stop polling, clear hint, act on how long it was held. */
+		btn3_held = false;
+		k_work_cancel_delayable(&btn3_poll_work);
+		int64_t held = k_uptime_get() - btn3_press_ms;
+		btn3_hint = 0;
+		if (held >= BTN3_CANCEL_MS) {
+			LOG_INF("button #3 held >=10s -> cancelled");
+		} else if (held >= BTN3_BOOT_MS) {
+			LOG_INF("button #3 held %lldms -> UF2 bootloader", held);
+			nrf_power_gpregret_set(NRF_POWER, 0, ADAFRUIT_UF2_MAGIC);
+			k_sleep(K_MSEC(50));
+			sys_reboot(SYS_REBOOT_COLD);
+		} else if (held >= BTN3_RESET_MS) {
+			LOG_INF("button #3 held %lldms -> reboot", held);
+			k_sleep(K_MSEC(50));
+			sys_reboot(SYS_REBOOT_COLD);
+		} else {
+			LOG_INF("button #3 tapped (%lldms) -> ignored", held);
+		}
+		return;
+	}
+	if (pressed) {
+		LOG_INF("button #%u (%s) pressed", idx + 1, elron_button_name[idx]);
+	}
+}
+#endif
+
+#if BUTTON_DISCOVER
+/* ── Wiring scanner ─────────────────────────────────────────────────────────
+ * Every free XIAO header pin is a candidate. Each cycle we drive one candidate
+ * low (push-pull) and read the others (input + pull-up); a held button shows up
+ * as a short — the read pin goes low. We also test a "nothing driven" baseline
+ * to catch a button wired straight to GND. Confirmed shorts are tallied; the pin
+ * that shorts to the most others is the shared common. Never returns. */
+struct disc_cand { const struct device *port; uint8_t pin; const char *name; };
+
+static void button_discover(void)
+{
+	const struct disc_cand c[] = {
+		{ gpio0_dev,  2, "D0"  },   /* P0.02 */
+		{ gpio0_dev,  3, "D1"  },   /* P0.03 */
+		{ gpio0_dev, 28, "D2"  },   /* P0.28 */
+		{ gpio1_dev, 13, "D8"  },   /* P1.13 */
+		{ gpio1_dev, 15, "D10" },   /* P1.15 */
+	};
+	const int n = ARRAY_SIZE(c);
+	static uint16_t pair[8][8];   /* pair[i][j] (i<j) = shorts seen between i,j */
+	static uint16_t gnd[8];       /* gnd[i] = times i read low with nothing driven */
+	const uint16_t HIT_OK = 3;
+
+	for (int i = 0; i < n; i++) {
+		gpio_pin_configure(c[i].port, c[i].pin, GPIO_INPUT | GPIO_PULL_UP);
+	}
+
+	lv_disp_t *disp = lv_disp_get_default();
+	if (disp && disp->driver) {
+		disp->driver->sw_rotate = 1;
+		lv_disp_set_rotation(disp, LV_DISP_ROT_270);
+	}
+	lv_obj_t *scr = lv_scr_act();
+	lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+	lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+	lv_obj_t *title = lv_label_create(scr);
+	lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+	lv_obj_set_style_text_color(title, lv_color_hex(0xfb4f14), 0);
+	lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 4);
+	lv_label_set_text(title, "WIRING SCAN");
+	lv_obj_t *hint = lv_label_create(scr);
+	lv_obj_set_style_text_font(hint, &lv_font_montserrat_16, 0);
+	lv_obj_set_style_text_color(hint, lv_color_hex(0xb4bcc6), 0);
+	lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 34);
+	lv_label_set_text(hint, "hold each button (one at a time)");
+	lv_obj_t *out = lv_label_create(scr);
+	lv_obj_set_style_text_font(out, &lv_font_montserrat_20, 0);
+	lv_obj_set_style_text_color(out, lv_color_white(), 0);
+	lv_obj_set_width(out, 232);
+	lv_obj_align(out, LV_ALIGN_TOP_LEFT, 8, 62);
+	lv_label_set_text(out, "press a button...");
+
+	char buf[256];
+	for (;;) {
+		/* Baseline: nothing driven — a low pin is shorted to GND. */
+		for (int i = 0; i < n; i++) {
+			gpio_pin_configure(c[i].port, c[i].pin, GPIO_INPUT | GPIO_PULL_UP);
+		}
+		k_busy_wait(60);
+		for (int i = 0; i < n; i++) {
+			if (gpio_pin_get_raw(c[i].port, c[i].pin) == 0 && gnd[i] < 0xffff) {
+				gnd[i]++;
+			}
+		}
+
+		/* Sweep: drive each candidate low, read the rest. */
+		for (int d = 0; d < n; d++) {
+			gpio_pin_configure(c[d].port, c[d].pin, GPIO_OUTPUT_LOW);
+			k_busy_wait(60);
+			for (int o = 0; o < n; o++) {
+				if (o == d) {
+					continue;
+				}
+				if (gpio_pin_get_raw(c[o].port, c[o].pin) == 0) {
+					int a = MIN(d, o), b = MAX(d, o);
+					if (pair[a][b] < 0xffff) {
+						pair[a][b]++;
+					}
+				}
+			}
+			gpio_pin_configure(c[d].port, c[d].pin, GPIO_INPUT | GPIO_PULL_UP);
+		}
+
+		/* Degree of each pin among confirmed shorts -> common = highest. */
+		int deg[8] = {0};
+		for (int a = 0; a < n; a++) {
+			for (int b = a + 1; b < n; b++) {
+				if (pair[a][b] >= HIT_OK) {
+					deg[a]++;
+					deg[b]++;
+				}
+			}
+		}
+		int common = -1;
+		for (int i = 0; i < n; i++) {
+			if (deg[i] >= 1 && (common < 0 || deg[i] > deg[common])) {
+				common = i;
+			}
+		}
+
+		size_t off = 0;
+		buf[0] = '\0';
+		if (common >= 0) {
+			off += snprintf(buf + off, sizeof(buf) - off,
+					"common: %s\nbtns:", c[common].name);
+			for (int i = 0; i < n && off < sizeof(buf); i++) {
+				int a = MIN(common, i), b = MAX(common, i);
+				if (i != common && pair[a][b] >= HIT_OK) {
+					off += snprintf(buf + off, sizeof(buf) - off,
+							" %s", c[i].name);
+				}
+			}
+			if (off < sizeof(buf)) {
+				off += snprintf(buf + off, sizeof(buf) - off, "\n");
+			}
+		}
+		for (int i = 0; i < n && off < sizeof(buf); i++) {
+			if (gnd[i] >= HIT_OK) {
+				off += snprintf(buf + off, sizeof(buf) - off,
+						"%s - GND\n", c[i].name);
+			}
+		}
+		if (off == 0) {
+			snprintf(buf, sizeof(buf), "press a button...");
+		}
+		lv_label_set_text(out, buf);
+
+		lv_task_handler();
+		k_sleep(K_MSEC(15));
+	}
+}
+#endif /* BUTTON_DISCOVER */
+
 int main(void)
 {
 	/* USB CDC-ACM console — don't block waiting for a terminal. */
@@ -291,6 +528,51 @@ int main(void)
 	}
 #endif
 
+#if BUTTON_DISCOVER
+	/* Self-discover the button wiring on screen, nothing else. Never returns. */
+	button_discover();
+#endif
+
+#if BUTTON_TEST
+	/* Confirm the three buttons + debounce on screen, nothing else. */
+	if (elron_buttons_init(btn_test_cb)) {
+		LOG_ERR("buttons init failed");
+	}
+	lv_disp_t *disp = lv_disp_get_default();
+	if (disp && disp->driver) {
+		disp->driver->sw_rotate = 1;
+		lv_disp_set_rotation(disp, LV_DISP_ROT_270);
+	}
+	lv_obj_t *scr = lv_scr_act();
+	lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+	lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+	lv_obj_t *title = lv_label_create(scr);
+	lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+	lv_obj_set_style_text_color(title, lv_color_hex(0xfb4f14), 0);
+	lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+	lv_label_set_text(title, "BUTTON TEST");
+	lv_obj_t *rows[ELRON_NUM_BUTTONS];
+	for (int i = 0; i < ELRON_NUM_BUTTONS; i++) {
+		rows[i] = lv_label_create(scr);
+		lv_obj_set_style_text_font(rows[i], &lv_font_montserrat_24, 0);
+		lv_obj_set_style_text_color(rows[i], lv_color_white(), 0);
+		lv_obj_align(rows[i], LV_ALIGN_TOP_LEFT, 24, 56 + i * 40);
+	}
+	for (;;) {
+		uint32_t st = elron_buttons_state();
+		for (int i = 0; i < ELRON_NUM_BUTTONS; i++) {
+			bool down = (st & BIT(i)) != 0;
+			lv_obj_set_style_text_color(rows[i],
+				down ? lv_color_hex(0x35c46a) : lv_color_hex(0x808080), 0);
+			lv_label_set_text_fmt(rows[i], "#%d %s  %s  x%u", i + 1,
+				elron_button_name[i], down ? "DOWN" : " -- ",
+				btn_press_cnt[i]);
+		}
+		lv_task_handler();
+		k_sleep(K_MSEC(20));
+	}
+#endif
+
 	k_work_init(&apply_work, apply_work_fn);
 
 	/* Persisted schedule first, so the screen has content before any BLE. */
@@ -307,8 +589,22 @@ int main(void)
 		LOG_ERR("ble init failed");
 	}
 
+#if !BUTTON_TEST
+	k_work_init_delayable(&btn3_poll_work, btn3_poll_fn);
+	if (elron_buttons_init(btn_cb)) {
+		LOG_ERR("buttons init failed");
+	}
+#endif
+
 	int64_t last_tick = 0;
 	while (1) {
+#if !BUTTON_TEST
+		/* Live hold-to-reset/bootloader hint (cheap; only redraws on change). */
+		elron_ui_button_hint(btn3_hint);
+		if (btn3_held) {
+			backlight_set(true);   /* make the hint visible even if it's dark */
+		}
+#endif
 		lv_task_handler();
 
 		/* Once a second: screen schedule + UI + charge cap (uptime-based so it

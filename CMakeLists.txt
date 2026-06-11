@@ -10,6 +10,7 @@ target_sources(app PRIVATE
   src/ble_svc.c
   src/ui.c
   src/battery.c
+  src/buttons.c
 )
 
 target_include_directories(app PRIVATE src)

@@ -20,6 +20,7 @@ static lv_obj_t *lbl_lead;      /* big leave countdown / GO NOW */
 static lv_obj_t *lbl_train;     /* which train: HH:MM -> dest */
 static lv_obj_t *lbl_then;      /* following departures */
 static lv_obj_t *lbl_status;
+static lv_obj_t *lbl_hint;       /* hold-to-reset/bootloader overlay */
 
 static void style_label(lv_obj_t *l, const lv_font_t *font, lv_color_t color)
 {
@@ -74,6 +75,45 @@ void elron_ui_init(void)
 	lv_obj_set_style_text_align(lbl_status, LV_TEXT_ALIGN_CENTER, 0);
 	lv_obj_align(lbl_status, LV_ALIGN_BOTTOM_MID, 0, -4);
 	lv_label_set_text(lbl_status, "starting...");
+
+	/* Hold-to-reset/bootloader hint: centered banner, hidden until #3 is held. */
+	lbl_hint = lv_label_create(scr);
+	style_label(lbl_hint, &lv_font_montserrat_24, COL_TEXT);
+	lv_obj_set_style_bg_color(lbl_hint, COL_ELRON, 0);
+	lv_obj_set_style_bg_opa(lbl_hint, LV_OPA_COVER, 0);
+	lv_obj_set_style_pad_all(lbl_hint, 12, 0);
+	lv_obj_set_width(lbl_hint, 240);
+	lv_obj_set_style_text_align(lbl_hint, LV_TEXT_ALIGN_CENTER, 0);
+	lv_obj_align(lbl_hint, LV_ALIGN_CENTER, 0, 0);
+	lv_label_set_text(lbl_hint, "");
+	lv_obj_add_flag(lbl_hint, LV_OBJ_FLAG_HIDDEN);
+}
+
+void elron_ui_button_hint(int state)
+{
+	static int last = -1;
+	if (state == last) {
+		return;   /* no change -> no redraw */
+	}
+	last = state;
+
+	if (state <= 0) {
+		lv_obj_add_flag(lbl_hint, LV_OBJ_FLAG_HIDDEN);
+		return;
+	}
+
+	const char *msg;
+	lv_color_t bg = COL_ELRON;
+	switch (state) {
+	case 1:  msg = "Hold 3s\nfor reset"; break;
+	case 2:  msg = "Keep holding\nfor bootloader"; break;
+	case 3:  msg = "Release for\nbootloader"; bg = COL_URGENT; break;
+	default: msg = "Cancelled"; bg = COL_DIM; break;
+	}
+	lv_label_set_text(lbl_hint, msg);
+	lv_obj_set_style_bg_color(lbl_hint, bg, 0);
+	lv_obj_clear_flag(lbl_hint, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_move_foreground(lbl_hint);
 }
 
 /* "1h 05m" / "12 min" */

@@ -23,6 +23,8 @@ the board persists them to flash and runs offline on battery.
 - `boards/xiao_ble.overlay` — ST7789 on SPI3 + GPIO backlight; disables the board
   peripherals (`i2c1`/`spi2`/`uart0`) that otherwise squat on the display pins.
 - `prj.conf`, `CMakeLists.txt`, `src/` — the Zephyr/NCS firmware.
+- `src/buttons.c` — three front-panel buttons (debounced); one is a staged
+  hold-to-reset / hold-longer-for-bootloader. See [Buttons](#buttons).
 - `companion/` — the cross-platform `uv` app (`elron_push.py`) that fetches live
   data and pushes it over USB/BLE. See `companion/README.md`.
 - `build.sh` — builds (NCS v2.7.0) and flashes hands-free over BLE.
@@ -40,6 +42,10 @@ RST and copy `build/zephyr/zephyr.uf2` onto the `XIAO-SENSE` drive (or run
 toolchain bundle but with system git first on `PATH` (the bundled git is broken on
 Ubuntu 24.04). The pin is deliberate — v2.7.0 still has the direct-SPI `st7789v`
 binding the overlay uses; Zephyr 3.7+ replaced it with MIPI-DBI.
+
+Once the firmware is running you can also enter the bootloader **without a PC or
+the serial touch**: hold the reset/bootloader button ~6 s until the UF2 drive
+mounts, then copy the `.uf2` onto it (see [Buttons](#buttons)).
 
 ## Run the companion (Windows / Linux / macOS)
 
@@ -76,6 +82,25 @@ a misspelled name suggests close matches. `walk_min` is your door-to-platform ti
   `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\`.
 - Linux: install the systemd user unit `companion/elron-companion.service`
   (instructions are in the file header).
+
+## Buttons
+
+Three front-panel buttons on the XIAO header — D0/D1/D2 as inputs sharing a common
+on D8 (the firmware drives it low; inputs use internal pull-ups), debounced in
+`src/buttons.c`.
+
+- **Reset / bootloader button** — a deliberately staged *hold*, so a tap does
+  nothing (it can't be triggered by accident). An on-screen banner shows the stage
+  as you hold:
+  - hold ~3 s, release → **reset** (clean reboot; also re-syncs, since the clock
+    is RAM-only)
+  - keep holding to ~6 s, release → reboot into the **UF2 bootloader** — a
+    hardware DFU trigger, so you can reflash without the 1200-baud serial touch
+  - hold past 10 s → cancelled, nothing happens
+
+  Thresholds live in `src/main.c` (`BTN3_RESET_MS` / `BTN3_BOOT_MS` /
+  `BTN3_CANCEL_MS`).
+- **Two spare buttons** — wired and debounced, no action assigned yet.
 
 ## How it works
 
