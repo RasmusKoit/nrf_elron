@@ -49,8 +49,8 @@ mounts, then copy the `.uf2` onto it (see [Buttons](#buttons)).
 
 ## Run the companion (Windows / Linux / macOS)
 
-Needs a real Bluetooth radio (so **not** WSL2). USB push works the same on every OS
-— the board's data port is `COMx` on Windows, `/dev/ttyACM*` on Linux/macOS.
+Needs a real Bluetooth radio. USB push works the same on every OS — the board's
+data port is `COMx` on Windows, `/dev/ttyACM*` on Linux/macOS.
 
 ```bash
 cd companion

@@ -8,8 +8,8 @@ Live source: Elron's Ridango backend (region 64), no API key. Same data as
 elron.pilet.ee, so it's current (not a snapshot).
 
 Runs on Windows, Linux (BlueZ), or macOS — any machine with a real Bluetooth
-radio (NOT WSL2, which has no BT). USB push works the same everywhere (the board's
-data port is COMx on Windows, /dev/ttyACM* on Linux/macOS).
+radio. USB push works the same everywhere (the board's data port is COMx on
+Windows, /dev/ttyACM* on Linux/macOS).
     uv sync
     uv run elron_push.py                 # fetch a week + push once
     uv run elron_push.py --dry-run       # fetch + print only

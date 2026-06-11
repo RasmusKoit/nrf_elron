@@ -7,8 +7,8 @@ train. When the board is plugged in it pushes over **USB**; otherwise over **BLE
 
 ## Where to run it
 
-Windows, Linux (BlueZ), or macOS — anything with a real Bluetooth radio. **Not from
-WSL2** (no BT there). USB-only pushes work over the cable regardless.
+Windows, Linux (BlueZ), or macOS — anything with a real Bluetooth radio. USB-only
+pushes work over the cable regardless.
 
 ## Setup (uv)
 
