@@ -96,6 +96,11 @@ static ssize_t sched_write(struct bt_conn *conn, const struct bt_gatt_attr *attr
 	if (dest + dlen > sizeof(rx_buf)) {
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
 	}
+	/* seq 0 begins a fresh transfer: clear the high-water mark so a re-push or a
+	 * dropped/gapped chunk can't complete against stale bytes from a prior one. */
+	if (seq == 0) {
+		rx_len = 0;
+	}
 	memcpy(&rx_buf[dest], &b[1], dlen);
 	if (dest + dlen > rx_len) {
 		rx_len = dest + dlen;

@@ -111,6 +111,7 @@ static int schedule_save(void)
 /* ── Wire decode (v3) ─────────────────────────────────────────────────── */
 static int rd_str(const uint8_t *buf, size_t len, size_t *p, char *dst, size_t cap)
 {
+	if (cap == 0) return -EINVAL;   /* else 'cap - 1' (size_t) underflows to SIZE_MAX */
 	if (*p >= len) return -EINVAL;
 	uint8_t n = buf[(*p)++];
 	if (*p + n > len) return -EINVAL;
@@ -170,13 +171,22 @@ int elron_schedule_apply_wire(const uint8_t *buf, size_t len)
 	s.count = count;
 	s.synced_epoch = epoch;
 
+	/* Persist only when the timetable content actually changed. Every push carries
+	 * a fresh synced_epoch, so comparing with that one field neutralised avoids
+	 * rewriting ~1.2 KB to NVS (and the periodic GC sector-erase that costs) on
+	 * identical re-pushes. The RAM clock is always re-anchored regardless. */
+	uint32_t new_synced = s.synced_epoch;
+	s.synced_epoch = sched.synced_epoch;
+	bool changed = !sched_valid || memcmp(&s, &sched, sizeof(s)) != 0;
+	s.synced_epoch = new_synced;
+
 	memcpy(&sched, &s, sizeof(sched));
 	sched_valid = true;
 	elron_clock_set(epoch, tz);
-	LOG_INF("applied %u departures (%u dests, walk %um)",
-		count, s.ndest, s.walk_min);
+	LOG_INF("applied %u departures (%u dests, walk %um)%s",
+		count, s.ndest, s.walk_min, changed ? "" : " [unchanged]");
 
-	return schedule_save();
+	return changed ? schedule_save() : 0;
 }
 
 const struct elron_schedule *elron_schedule_get(void)

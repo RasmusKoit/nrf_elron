@@ -115,6 +115,7 @@ void elron_ui_button_hint(int state)
 	case 1:  msg = "Hold 3s\nfor reset"; break;
 	case 2:  msg = "Keep holding\nfor bootloader"; break;
 	case 3:  msg = "Release for\nbootloader"; bg = COL_URGENT; break;
+	case 5:  msg = "Release NOW\nor it cancels"; bg = COL_URGENT; break;
 	default: msg = "Cancelled"; bg = COL_DIM; break;
 	}
 	lv_label_set_text(lbl_hint, msg);
@@ -224,8 +225,8 @@ void elron_ui_refresh(bool ble_connected)
 	const int grace = 180;
 	int target = -1;
 	for (uint16_t i = 0; i < s->count; i++) {
-		if (s->dep[i].dep_epoch + 60 < now) {
-			continue;   /* already departed */
+		if ((int32_t)(s->dep[i].dep_epoch - now) <= 0) {
+			continue;   /* already departed — can't catch it */
 		}
 		int lead = (int)(s->dep[i].dep_epoch - now) - walk_s;
 		if (lead >= -grace) {
@@ -275,8 +276,8 @@ void elron_ui_refresh(bool ble_connected)
 		size_t off = 0; buf[0] = '\0';
 		int shown = 0;
 		for (uint16_t i = target + 1; i < s->count && shown < 2; i++) {
-			if (s->dep[i].dep_epoch + 60 < now) {
-				continue;
+			if ((int32_t)(s->dep[i].dep_epoch - now) <= 0) {
+				continue;   /* already departed */
 			}
 			char when[24];
 			fmt_when(s->dep[i].dep_epoch, s->tz_off_min, now, when, sizeof(when));

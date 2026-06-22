@@ -11,14 +11,96 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/drivers/uart/cdc_acm.h>
+#include <zephyr/drivers/watchdog.h>
 #include <zephyr/usb/usb_device.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/sys/reboot.h>
+#include <zephyr/fatal.h>
 #include <zephyr/logging/log.h>
 #include <hal/nrf_power.h>
 #include <lvgl.h>
 #include <string.h>
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
+
+/* ── Self-recovery ───────────────────────────────────────────────────────────
+ * The Zephyr default fatal-error handler HALTS the CPU forever (interrupts off):
+ * a fault — null deref, MPU/stack-overflow trap, kernel panic — would leave the
+ * panel frozen on its last frame with the system workqueue dead, so even the
+ * button-driven reset/bootloader stop responding (exactly the "blank screen the
+ * next day, can't reset" symptom). Override it to cold-reboot instead, so any
+ * fault self-heals: the board reboots and the companion auto-resyncs the clock.
+ * NOTE: do NOT request the UF2 bootloader here (leave GPREGRET alone) — we want
+ * to come straight back up into the app, not get stuck in DFU. */
+void k_sys_fatal_error_handler(unsigned int reason, const z_arch_esf_t *esf)
+{
+	ARG_UNUSED(reason);
+	ARG_UNUSED(esf);
+	sys_reboot(SYS_REBOOT_COLD);
+	CODE_UNREACHABLE;
+}
+
+/* Hardware watchdog: catches true HANGS/deadlocks (a fault goes through the
+ * handler above; a livelock/deadlock or CPU lockup does not). Fed from the main
+ * loop every iteration (<=500ms apart even overnight), so if that loop ever
+ * wedges the SoC resets within WDT_TIMEOUT_MS and the device comes back.
+ * The timeout is deliberately generous: the Adafruit/Seeed UF2 bootloader does
+ * NOT feed the watchdog and the nRF52 WDT keeps running across a soft reset, so
+ * the window must comfortably exceed a normal drag-drop DFU. We also feed it
+ * just before any intentional reboot-to-bootloader to hand the bootloader a full
+ * window. (The WDT runs during WFI sleep, so an idle deadlock is still caught.) */
+#define WDT_TIMEOUT_MS 30000
+static const struct device *const wdt_dev = DEVICE_DT_GET(DT_NODELABEL(wdt0));
+static int wdt_channel = -1;
+
+static void watchdog_init(void)
+{
+	if (!device_is_ready(wdt_dev)) {
+		LOG_ERR("watchdog not ready");
+		return;
+	}
+	struct wdt_timeout_cfg cfg = {
+		.window = { .min = 0U, .max = WDT_TIMEOUT_MS },
+		.callback = NULL,
+		.flags = WDT_FLAG_RESET_SOC,
+	};
+	wdt_channel = wdt_install_timeout(wdt_dev, &cfg);
+	if (wdt_channel < 0) {
+		LOG_ERR("wdt_install_timeout: %d", wdt_channel);
+		return;
+	}
+	int rc = wdt_setup(wdt_dev, WDT_OPT_PAUSE_HALTED_BY_DBG);
+	if (rc) {
+		LOG_ERR("wdt_setup: %d", rc);
+		wdt_channel = -1;
+		return;
+	}
+	LOG_INF("watchdog armed (%d ms)", WDT_TIMEOUT_MS);
+}
+
+static inline void watchdog_feed(void)
+{
+	if (wdt_channel >= 0) {
+		wdt_feed(wdt_dev, wdt_channel);
+	}
+}
+
+/* System-workqueue liveness canary. The watchdog is fed from the main loop, so a
+ * wedged main loop is caught — but the button-driven reset/bootloader runs on the
+ * SYSTEM workqueue (debounce_work, btn3_poll_work), and a workqueue-only deadlock
+ * would leave that path dead while the main loop keeps petting the dog forever.
+ * So a self-resubmitting work item bumps a heartbeat, and the main loop only pets
+ * the watchdog when the heartbeat has advanced — making the dog prove BOTH the
+ * main loop AND the system workqueue are alive. */
+static struct k_work_delayable wq_canary;
+static atomic_t wq_heartbeat;
+
+static void wq_canary_fn(struct k_work *w)
+{
+	ARG_UNUSED(w);
+	atomic_inc(&wq_heartbeat);
+	k_work_reschedule(&wq_canary, K_MSEC(2000));   /* << WDT_TIMEOUT_MS */
+}
 
 /* Set to 1 to run ONLY a full-screen colour-cycle panel test (no LVGL/BLE). */
 #define PANEL_TEST 0
@@ -56,13 +138,22 @@ static struct k_work apply_work;
 static void apply_work_fn(struct k_work *w)
 {
 	ARG_UNUSED(w);
+	/* Snapshot the shared inbox under irq_lock so the CDC RX ISR can't tear the
+	 * buffer (or clobber pending_len) out from under the multi-ms parse below.
+	 * static: ~1.1 KB is too big for the system-workqueue stack. */
+	static uint8_t local_buf[sizeof(pending_buf)];
+	unsigned int key = irq_lock();
 	uint16_t len = pending_len;
+	bool from_serial = pending_from_serial;
+	if (len) {
+		memcpy(local_buf, pending_buf, len);
+		pending_len = 0;
+	}
+	irq_unlock(key);
 	if (len == 0) {
 		return;
 	}
-	bool from_serial = pending_from_serial;
-	int rc = elron_schedule_apply_wire(pending_buf, len);
-	pending_len = 0;
+	int rc = elron_schedule_apply_wire(local_buf, len);
 	if (rc) {
 		LOG_WRN("apply_wire failed: %d", rc);
 	} else {
@@ -99,6 +190,7 @@ static void dfu_touch_thread(void *a, void *b, void *c)
 		if (dfu_requested) {
 			LOG_INF("1200-baud touch -> rebooting to UF2 bootloader");
 			nrf_power_gpregret_set(NRF_POWER, 0, ADAFRUIT_UF2_MAGIC);
+			watchdog_feed();   /* hand the bootloader a full WDT window */
 			k_sleep(K_MSEC(50));
 			sys_reboot(SYS_REBOOT_COLD);
 		}
@@ -113,9 +205,13 @@ static void submit_payload(const uint8_t *buf, size_t len, bool from_serial)
 	if (len > sizeof(pending_buf)) {
 		len = sizeof(pending_buf);
 	}
+	/* Publish all three fields atomically vs apply_work_fn's snapshot (this can
+	 * run from the CDC RX ISR). */
+	unsigned int key = irq_lock();
 	memcpy(pending_buf, buf, len);
 	pending_len = len;
 	pending_from_serial = from_serial;
+	irq_unlock(key);
 	k_work_submit(&apply_work);
 }
 
@@ -240,13 +336,24 @@ static bool screen_update(void)
 #endif
 
 	if (on != screen_on_state) {
+		/* display_blanking_on/off issues a single command transaction on this
+		 * thread, but the LVGL flush thread (CONFIG_LV_Z_FLUSH_THREAD) may be mid
+		 * display_write — and the ST7789 driver toggles the shared DC line around
+		 * each SPI write without locking, so a concurrent flush can clobber DC and
+		 * make the panel latch our DISP_ON/DISP_OFF opcode as pixel data (lost).
+		 * If DISP_ON is dropped the screen stays dark until the next day. Force a
+		 * full render and let lv_refr_now() drive it to completion (it waits on the
+		 * flush thread via wait_cb), so the bus is provably idle before we toggle. */
 		if (on) {
-			display_blanking_off(display_dev);   /* re-init panel output */
-			elron_ui_refresh(elron_ble_connected());
-			lv_obj_invalidate(lv_scr_act());     /* force a full redraw */
+			elron_ui_refresh(elron_ble_connected());  /* fresh content first */
+			lv_obj_invalidate(lv_scr_act());
+			lv_refr_now(NULL);            /* render it + drain the flush thread */
+			display_blanking_off(display_dev);  /* reveal the ready frame, bus idle */
 		} else {
 			backlight_set(false);
-			display_blanking_on(display_dev);    /* panel output off */
+			lv_obj_invalidate(lv_scr_act());
+			lv_refr_now(NULL);            /* drain the flush thread before DISP_OFF */
+			display_blanking_on(display_dev);   /* panel output off */
 		}
 		screen_on_state = on;
 	}
@@ -297,6 +404,8 @@ static void btn3_poll_fn(struct k_work *w)
 	if (held >= BTN3_CANCEL_MS) {
 		btn3_hint = 4;            /* "Cancelled" — release now does nothing */
 		return;                  /* stop polling: escape hatch tripped */
+	} else if (held >= BTN3_CANCEL_MS - 1000) {
+		btn3_hint = 5;           /* last second: release NOW or it cancels */
 	} else if (held >= BTN3_BOOT_MS) {
 		btn3_hint = 3;           /* bootloader armed */
 	} else if (held >= BTN3_RESET_MS) {
@@ -327,6 +436,7 @@ static void btn_cb(uint8_t idx, bool pressed)
 		} else if (held >= BTN3_BOOT_MS) {
 			LOG_INF("button #3 held %lldms -> UF2 bootloader", held);
 			nrf_power_gpregret_set(NRF_POWER, 0, ADAFRUIT_UF2_MAGIC);
+			watchdog_feed();   /* hand the bootloader a full WDT window */
 			k_sleep(K_MSEC(50));
 			sys_reboot(SYS_REBOOT_COLD);
 		} else if (held >= BTN3_RESET_MS) {
@@ -510,8 +620,12 @@ int main(void)
 	LOG_INF("Elron train display booting");
 
 	if (!device_is_ready(display_dev)) {
-		LOG_ERR("display device NOT READY");
-		return 0;
+		/* A transient SPI/power glitch at boot would otherwise leave a dead board:
+		 * main() returns before the watchdog is even armed, so nothing recovers it.
+		 * Cold-reboot to retry init from scratch instead. */
+		LOG_ERR("display device NOT READY -> rebooting");
+		k_sleep(K_MSEC(200));   /* let the log drain to USB CDC first */
+		sys_reboot(SYS_REBOOT_COLD);
 	}
 	LOG_INF("display device ready");
 
@@ -609,8 +723,23 @@ int main(void)
 	}
 #endif
 
+	/* Start the workqueue canary, then arm the watchdog last, once init is done. */
+	k_work_init_delayable(&wq_canary, wq_canary_fn);
+	k_work_reschedule(&wq_canary, K_NO_WAIT);
+	watchdog_init();
+
 	int64_t last_tick = 0;
+	atomic_val_t last_hb = atomic_get(&wq_heartbeat) - 1;   /* != hb -> feed once now */
 	while (1) {
+		/* Pet the watchdog — but only if the system workqueue is also making
+		 * progress (heartbeat advanced). If EITHER this loop wedges (stops petting)
+		 * or the workqueue wedges (heartbeat stalls), the SoC resets within
+		 * WDT_TIMEOUT_MS and recovers. */
+		atomic_val_t hb = atomic_get(&wq_heartbeat);
+		if (hb != last_hb) {
+			last_hb = hb;
+			watchdog_feed();
+		}
 #if !BUTTON_TEST
 		/* Live hold-to-reset/bootloader hint (cheap; only redraws on change). */
 		elron_ui_button_hint(btn3_hint);
@@ -622,6 +751,9 @@ int main(void)
 		 * and skip the schedule refresh until the player exits. */
 		if (elron_game_active()) {
 			if (!screen_on_state) {
+				/* Drain the flush thread before toggling DC (see screen_update). */
+				lv_obj_invalidate(lv_scr_act());
+				lv_refr_now(NULL);
 				display_blanking_off(display_dev);
 				screen_on_state = true;
 			}
@@ -637,7 +769,14 @@ int main(void)
 			continue;
 		}
 #endif
-		lv_task_handler();
+		/* Only drive LVGL while the panel is actually showing something. Overnight
+		 * (screen blanked) this keeps the flush thread idle — saving power and
+		 * guaranteeing no flush is in flight when screen_update() re-issues DISP_ON
+		 * at 09:00, which is what closes the DC-line race. screen_update() itself
+		 * does its own render at each on/off transition. */
+		if (screen_on_state) {
+			lv_task_handler();
+		}
 
 		/* Once a second: screen schedule + UI + charge cap (uptime-based so it
 		 * works regardless of how long we idle below). */
