@@ -331,6 +331,12 @@ static void backlight_init(void)
  * always comes back cleanly. Returns whether the screen is currently on. */
 static bool screen_on_state = true;
 
+/* True while front button #3 is held. Declared here (not with the other btn3
+ * state) so screen_update() can keep the panel awake while the hold-to-reset/
+ * bootloader hint is showing — otherwise, overnight, the hint would be drawn to a
+ * blanked panel and never seen. */
+static volatile bool btn3_held;
+
 /* Set to 1 to test blank/re-init: screen off for the first 25 s, then on. */
 #define SCREEN_TEST 0
 
@@ -342,6 +348,12 @@ static bool screen_update(void)
 	int lm = elron_clock_local_min();
 	bool on = (lm < 0) || (lm >= BL_ON_MIN && lm < BL_OFF_MIN);
 #endif
+
+	/* Keep the screen lit while #3 is held so the reset/bootloader hint is
+	 * visible even overnight; it re-blanks on the next tick after release. */
+	if (btn3_held) {
+		on = true;
+	}
 
 	if (on != screen_on_state) {
 		/* display_blanking_on/off issues a single command transaction on this
@@ -399,8 +411,8 @@ static void btn_test_cb(uint8_t idx, bool pressed)
 
 static struct k_work_delayable btn3_poll_work;
 static volatile int64_t btn3_press_ms;
-static volatile bool    btn3_held;
 static volatile int     btn3_hint;   /* feeds elron_ui_button_hint() from main loop */
+/* btn3_held is declared up by screen_update() so it can keep the panel awake. */
 
 static void btn3_poll_fn(struct k_work *w)
 {
@@ -752,7 +764,16 @@ int main(void)
 		/* Live hold-to-reset/bootloader hint (cheap; only redraws on change). */
 		elron_ui_button_hint(btn3_hint);
 		if (btn3_held) {
-			backlight_set(true);   /* make the hint visible even if it's dark */
+			if (!screen_on_state) {
+				/* Wake the panel right away so the hint is visible even when the
+				 * screen is blanked (overnight). screen_update() keeps it lit
+				 * while held, then re-blanks on the next tick after release. */
+				lv_obj_invalidate(lv_scr_act());
+				lv_refr_now(NULL);
+				display_blanking_off(display_dev);
+				screen_on_state = true;
+			}
+			backlight_set(true);
 		}
 
 		/* Game mode takes over the loop: tick ~30 fps, keep the screen lit,

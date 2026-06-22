@@ -123,8 +123,11 @@ const char *battery_symbol(void)
 	if (!ready) {
 		return "";
 	}
-	/* Bolt only while actively charging; once capped, show the level. */
-	if (usb_present() && charging_on) {
+	/* Plugged in -> always show the charge bolt. We still pause the actual charge
+	 * current at the cap for LiPo longevity (charging_on toggles), but to the user
+	 * "on USB" should read as charging — otherwise a topped-off battery sitting in
+	 * the 4.11->3.75 V hold band looks like charging silently stopped. */
+	if (usb_present()) {
 		return LV_SYMBOL_CHARGE;
 	}
 	int mv = vbat_cached();
