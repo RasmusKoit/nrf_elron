@@ -186,9 +186,17 @@ static void connected_cb(struct bt_conn *conn, uint8_t err)
 	LOG_INF("central connected");
 }
 
+/* Slow connectable advertising (~1 s vs the 100-150 ms default BT_LE_ADV_CONN).
+ * The companion only needs to find the board occasionally, so this cuts the
+ * radio's continuous idle-advertising current roughly 7x for negligible extra
+ * discovery latency. */
+#define ELRON_ADV_SLOW \
+	BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONNECTABLE, \
+			BT_GAP_ADV_SLOW_INT_MIN, BT_GAP_ADV_SLOW_INT_MAX, NULL)
+
 static void start_adv(void)
 {
-	int err = bt_le_adv_start(BT_LE_ADV_CONN, ad, ARRAY_SIZE(ad),
+	int err = bt_le_adv_start(ELRON_ADV_SLOW, ad, ARRAY_SIZE(ad),
 				  sd, ARRAY_SIZE(sd));
 	if (err) {
 		LOG_ERR("adv start failed: %d", err);

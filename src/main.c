@@ -11,6 +11,7 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/drivers/uart/cdc_acm.h>
+#include <zephyr/drivers/pwm.h>
 #include <zephyr/drivers/watchdog.h>
 #include <zephyr/usb/usb_device.h>
 #include <zephyr/sys/atomic.h>
@@ -116,11 +117,15 @@ static void wq_canary_fn(struct k_work *w)
 #define BUTTON_DISCOVER 0
 
 static const struct device *display_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_display));
-/* Backlight: active-high GPIO P1.11 (gpio1 pin 11). */
-static const struct device *gpio1_dev = DEVICE_DT_GET(DT_NODELABEL(gpio1));
-#define BACKLIGHT_PIN 11
+/* Backlight: PWM-dimmed on P1.11 (PWM_OUT0 / pwm1 ch0) to save battery. Driven
+ * via the PWM driver in backlight_set(); period/pins come from the overlay. */
+static const struct device *const backlight_pwm = DEVICE_DT_GET(DT_NODELABEL(pwm1));
+#define BACKLIGHT_PWM_CH     0
+#define BACKLIGHT_PERIOD_NS  PWM_USEC(100)   /* 10 kHz: well above any flicker */
+#define BACKLIGHT_PCT        60              /* brightness % when "on" (battery) */
 #if BUTTON_DISCOVER
 static const struct device *gpio0_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
+static const struct device *gpio1_dev = DEVICE_DT_GET(DT_NODELABEL(gpio1));
 #endif
 
 /* Second CDC ACM port, dedicated to the host->board data push (separate from the
@@ -306,16 +311,19 @@ static int display_fill(const struct device *dev, uint16_t color)
 
 static void backlight_set(bool on)
 {
-	if (device_is_ready(gpio1_dev)) {
-		gpio_pin_set(gpio1_dev, BACKLIGHT_PIN, on ? 1 : 0);
+	if (!device_is_ready(backlight_pwm)) {
+		return;
 	}
+	/* on -> BACKLIGHT_PCT duty; off -> 0 (the nRF PWM driver drops the pin to a
+	 * static low and stops the peripheral at 0%/100%, so "off" draws nothing). */
+	uint32_t pulse = on ? (BACKLIGHT_PERIOD_NS * BACKLIGHT_PCT / 100) : 0;
+	pwm_set(backlight_pwm, BACKLIGHT_PWM_CH, BACKLIGHT_PERIOD_NS, pulse, 0);
 }
 
 static void backlight_init(void)
 {
-	if (device_is_ready(gpio1_dev)) {
-		gpio_pin_configure(gpio1_dev, BACKLIGHT_PIN, GPIO_OUTPUT_ACTIVE);
-	}
+	/* Pin + PWM are set up via devicetree (pwm1 / pinctrl); just start it off. */
+	backlight_set(false);
 }
 
 /* Turn the whole screen on/off on the daytime schedule. Off = backlight off +

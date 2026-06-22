@@ -39,6 +39,20 @@
 			low-power-enable;
 		};
 	};
+
+	/* Backlight dimming: PWM_OUT0 on P1.11 (was a plain GPIO). */
+	bl_pwm_default: bl_pwm_default {
+		group1 {
+			psels = <NRF_PSEL(PWM_OUT0, 1, 11)>;
+		};
+	};
+
+	bl_pwm_sleep: bl_pwm_sleep {
+		group1 {
+			psels = <NRF_PSEL(PWM_OUT0, 1, 11)>;
+			low-power-enable;
+		};
+	};
 };
 
 &spi3 {
@@ -76,6 +90,15 @@
 		ram-param = [00 F0];
 		rgb-param = [CD 08 14];
 	};
+};
+
+/* Backlight is PWM-dimmed for battery life. pwm0 is taken by the board's user
+ * LED, so drive P1.11 from pwm1 channel 0 (see backlight_set() in main.c). */
+&pwm1 {
+	status = "okay";
+	pinctrl-0 = <&bl_pwm_default>;
+	pinctrl-1 = <&bl_pwm_sleep>;
+	pinctrl-names = "default", "sleep";
 };
 
 &zephyr_udc0 {
