@@ -23,4 +23,8 @@ void elron_game_button(uint8_t idx, bool pressed);
 /* Advance one frame; call ~30x/s from the main loop while active. */
 void elron_game_tick(void);
 
+/* Leave the game and return to the schedule view (no-op if not active). Calls
+ * LVGL, so main-loop thread only. */
+void elron_game_quit(void);
+
 #endif /* ELRON_GAME_H_ */

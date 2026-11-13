@@ -364,6 +364,12 @@ static volatile bool btn_hold_armed;
 static int64_t batt_grace_until = BATT_GRACE_MS;   /* boot counts as "just had USB" */
 static int64_t batt_wake_until;
 static atomic_t btn_wake_req;   /* set by btn_cb (workqueue), consumed by main loop */
+/* Last battery_low() result, refreshed by the main loop about once a second so
+ * btn_cb (workqueue) can refuse to start the game without touching the ADC.
+ * The staged hold on #1 is deliberately NOT gated on it: its hint still lights
+ * the screen on a low cell, bounded to 10 s per press by the cancel, so reset
+ * and bootloader entry never have to be done blind. */
+static volatile bool batt_low_now;
 
 /* Set to 1 to test blank/re-init: screen off for the first 25 s, then on. */
 #define SCREEN_TEST 0
@@ -378,6 +384,7 @@ static bool screen_update(void)
 
 	int64_t now = k_uptime_get();
 	bool low = battery_low();   /* also clears the latch once USB is back */
+	batt_low_now = low;
 	if (battery_usb_present()) {
 		batt_grace_until = now + BATT_GRACE_MS;
 	} else {
@@ -524,7 +531,11 @@ static void btn_cb(uint8_t idx, bool pressed)
 		uint32_t st = elron_buttons_state();
 		if ((st & BIT(0)) && (st & BIT(1))) {
 			btn_hold_disarm();
-			elron_game_enter();
+			/* Game mode keeps the backlight lit, so no game on a nearly
+			 * empty cell — the chord just does nothing. */
+			if (!batt_low_now) {
+				elron_game_enter();
+			}
 			return;
 		}
 	}
@@ -544,6 +555,13 @@ static void btn_cb(uint8_t idx, bool pressed)
 		}
 		int64_t held = k_uptime_get() - btn_hold_start_ms;
 		btn_hold_disarm();
+		if (held >= BTN_CANCEL_MS) {
+			/* Past the cancel point, but the 100 ms poll hadn't run yet to
+			 * disarm. Decide on the hold time itself, never on poll timing —
+			 * otherwise a release just after 10 s landed in the bootloader. */
+			LOG_INF("button #1 held %lldms -> cancelled", held);
+			return;
+		}
 		if (held >= BTN_BOOT_MS) {
 			LOG_INF("button #1 held %lldms -> UF2 bootloader", held);
 			nrf_power_gpregret_set(NRF_POWER, 0, ADAFRUIT_UF2_MAGIC);
@@ -881,6 +899,15 @@ int main(void)
 			if (gnow - last_tick >= 1000) {
 				last_tick = gnow;
 				battery_charge_manage();
+				/* screen_update() doesn't run in game mode, so keep
+				 * sampling the cell here: if it drops below the cutoff
+				 * mid-game, quit and let the next schedule tick (forced
+				 * by last_tick = 0) blank the screen. */
+				batt_low_now = battery_low();
+				if (batt_low_now) {
+					elron_game_quit();
+					last_tick = 0;
+				}
 			}
 			k_sleep(K_MSEC(33));
 			continue;
