@@ -305,7 +305,9 @@ static int display_fill(const struct device *dev, uint16_t color)
 #endif /* PANEL_TEST */
 
 /* Backlight on between 09:00 and 23:00 local; off overnight to save battery.
- * On when the clock isn't set yet (so the screen is visible during setup). */
+ * On when the clock isn't set yet (so the screen is visible during setup).
+ * That is the whole story on USB; on battery the "Battery screen policy" below
+ * narrows it further. */
 #define BL_ON_MIN   (9 * 60)
 #define BL_OFF_MIN  (23 * 60)
 
@@ -341,6 +343,28 @@ static bool screen_on_state = true;
  * flattened the battery in about a day.) */
 static volatile bool btn_hold_armed;
 
+/* ── Battery screen policy ───────────────────────────────────────────────────
+ * The 09:00-23:00 schedule alone is fine on USB, but on battery it lit the
+ * backlight 14 h a day whether or not anyone was there. The cell holds roughly
+ * a day of screen-on time and a Friday-evening-to-Monday-morning stretch asks
+ * for ~33 h, so the board ran flat every weekend and was found dark on Monday
+ * (a dead battery, not a crash). An unsynced clock was worse still: "no time
+ * yet" meant screen on around the clock.
+ *
+ * So off USB the screen only stays lit:
+ *   - for BATT_GRACE_MS after USB power was last seen (or after boot), and only
+ *     inside the daytime window — covers a short undock without going dark;
+ *   - for BATT_WAKE_MS after a press of front button #1 or #2, at any hour.
+ * Otherwise it blanks exactly like overnight, keeping the clock and BLE alive.
+ * Below the low-battery cutoff it stays off regardless (battery_low()).
+ * Only #1/#2 wake it: #3 (D0) is the contact that failed physically, and a
+ * chattering button must not be able to hold the backlight on. */
+#define BATT_GRACE_MS  (15 * 60 * 1000)
+#define BATT_WAKE_MS   (60 * 1000)
+static int64_t batt_grace_until = BATT_GRACE_MS;   /* boot counts as "just had USB" */
+static int64_t batt_wake_until;
+static atomic_t btn_wake_req;   /* set by btn_cb (workqueue), consumed by main loop */
+
 /* Set to 1 to test blank/re-init: screen off for the first 25 s, then on. */
 #define SCREEN_TEST 0
 
@@ -351,6 +375,14 @@ static bool screen_update(void)
 #else
 	int lm = elron_clock_local_min();
 	bool on = (lm < 0) || (lm >= BL_ON_MIN && lm < BL_OFF_MIN);
+
+	int64_t now = k_uptime_get();
+	bool low = battery_low();   /* also clears the latch once USB is back */
+	if (battery_usb_present()) {
+		batt_grace_until = now + BATT_GRACE_MS;
+	} else {
+		on = !low && ((on && now < batt_grace_until) || now < batt_wake_until);
+	}
 #endif
 
 	/* Keep the screen lit while #1 is held so the reset/bootloader hint is
@@ -471,6 +503,12 @@ static void btn_hold_poll_fn(struct k_work *w)
 
 static void btn_cb(uint8_t idx, bool pressed)
 {
+	/* Any press of #1/#2 wakes a battery-blanked screen for BATT_WAKE_MS (see the
+	 * battery screen policy). Workqueue context: just flag it for the main loop. */
+	if (pressed && idx <= 1) {
+		atomic_set(&btn_wake_req, 1);
+	}
+
 	/* In the game, #1/#2 are just controls — the staged hold stays out of the way
 	 * so a jump (tap on #1) can never arm a reset. */
 	if (elron_game_active()) {
@@ -803,6 +841,13 @@ int main(void)
 			last_hb = hb;
 			watchdog_feed();
 		}
+
+		/* Button wake for a battery-blanked screen: open the wake window and run
+		 * the once-a-second tick right now instead of up to a second later. */
+		if (atomic_cas(&btn_wake_req, 1, 0)) {
+			batt_wake_until = k_uptime_get() + BATT_WAKE_MS;
+			last_tick = 0;
+		}
 #if !BUTTON_TEST
 		/* Live hold-to-reset/bootloader hint (cheap; only redraws on change). */
 		elron_ui_button_hint(btn_hint);
@@ -861,9 +906,9 @@ int main(void)
 			battery_charge_manage();
 		}
 
-		/* Overnight (screen off) idle much longer so the CPU sits in WFI most
-		 * of the time — low-power without losing the clock or BLE. While the
-		 * screen is on, tick fast for smooth scrolling. */
+		/* Screen off (overnight, or blanked on battery) idle much longer so the
+		 * CPU sits in WFI most of the time — low-power without losing the clock
+		 * or BLE. While the screen is on, tick fast for smooth scrolling. */
 		k_sleep(screen_on_state ? K_MSEC(15) : K_MSEC(500));
 	}
 	return 0;

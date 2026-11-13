@@ -35,6 +35,9 @@ LOG_MODULE_REGISTER(game, LOG_LEVEL_INF);
 #define OBST_MAX_GAP  240
 
 #define OVER_TIMEOUT_MS 20000      /* auto-exit from the game-over screen */
+#define TITLE_TIMEOUT_MS 60000     /* auto-exit from an untouched title screen:
+				    * game mode keeps the backlight lit, so a title
+				    * screen left open would drain the battery flat */
 
 #define COL_BG     lv_color_hex(0x000000)
 #define COL_ELRON  lv_color_hex(0xfb4f14)
@@ -65,6 +68,7 @@ static uint32_t    score, hi;
 static int         next_gap;
 static int         train_phase;
 static int64_t     over_ms;
+static int64_t     title_ms;
 static uint32_t    rng;
 
 /* Enter/press requests arrive on the debounce workqueue thread, but LVGL is not
@@ -121,6 +125,7 @@ static void set_state(enum gstate s)
 	state = s;
 	switch (s) {
 	case G_TITLE:
+		title_ms = k_uptime_get();
 		/* Clean "ready" scene: just the runner standing on the platform.
 		 * The train and obstacles stay hidden until the chase begins, so the
 		 * title text never collides with stray gameplay scenery. */
@@ -283,8 +288,10 @@ void elron_game_enter(void)
 {
 	/* Workqueue context: flag the request, do NOT touch LVGL. The main loop
 	 * sees active and applies the screen switch in elron_game_tick(). */
-	active = true;
+	/* Request first, then active: the tick must apply the enter (which restarts
+	 * the title/game-over timers) before it ever checks them. */
 	atomic_set(&enter_req, 1);
+	active = true;
 }
 
 static void game_exit(void)
@@ -362,6 +369,10 @@ void elron_game_tick(void)
 		}
 	} else if (state == G_OVER) {
 		if (k_uptime_get() - over_ms > OVER_TIMEOUT_MS) {
+			game_exit();
+		}
+	} else if (state == G_TITLE) {
+		if (k_uptime_get() - title_ms > TITLE_TIMEOUT_MS) {
 			game_exit();
 		}
 	}

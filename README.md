@@ -131,7 +131,15 @@ on D8 (the firmware drives it low; inputs use internal pull-ups), debounced in
   runs from the battery when unplugged, so the clock keeps going. Charge current is
   set in firmware via P0.13 (`CHARGE_CURRENT_MA` in `battery.c`, currently 100 mA;
   also supports 50 mA or off), and charging caps at ~90 %, resuming at ~50 % for
-  longevity. The status line shows a rough **battery icon** (charging bolt on USB).
+  longevity — or straight away whenever USB power returns after a spell on battery.
+  The status line shows a rough **battery icon** (charging bolt on USB).
+- **On battery**: the backlight is nearly all of the power budget, and the cell
+  only holds about a day of screen-on time. So off USB the screen stays lit for
+  15 min after power was last seen (daytime only), then blanks like overnight; a
+  press of button #1 or #2 lights it for 60 s at any hour. Below ~3.4 V it stays
+  off until USB returns, so the clock and BLE survive instead of the cell running
+  flat. Tunables: `BATT_GRACE_MS` / `BATT_WAKE_MS` in `main.c`, `LOW_BATT_MV` in
+  `battery.c`.
 - **Overnight**: the screen blanks **23:00–09:00** (backlight off + panel off, fully
   reversible), and the main loop idles longer while it's off for low-power sleep —
   without dropping the clock or BLE.
