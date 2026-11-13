@@ -304,6 +304,16 @@ static void game_exit(void)
 	LOG_INF("game: exit");
 }
 
+void elron_game_quit(void)
+{
+	/* Drop an enter that was requested but not applied yet, too, so the next
+	 * tick can't bring the game straight back. */
+	atomic_set(&enter_req, 0);
+	if (active) {
+		game_exit();
+	}
+}
+
 /* Apply one queued button press. Runs on the main-loop thread (drained by
  * elron_game_tick), so it's safe to call LVGL from here. */
 static void handle_button(uint8_t idx)
