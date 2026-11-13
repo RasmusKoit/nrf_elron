@@ -18,8 +18,8 @@
 		zephyr,console = &cdc_acm_uart0;
 	};
 
-	/* Backlight is a plain active-high GPIO on P1.11 (gpio1 pin 11),
-	 * driven directly in main.c. No dimming for v1. */
+	/* Backlight is PWM-dimmed on P1.11 via pwm1 (see &pwm1 below and
+	 * backlight_set() in main.c). */
 };
 
 &pinctrl {
