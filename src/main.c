@@ -88,7 +88,7 @@ static inline void watchdog_feed(void)
 
 /* System-workqueue liveness canary. The watchdog is fed from the main loop, so a
  * wedged main loop is caught — but the button-driven reset/bootloader runs on the
- * SYSTEM workqueue (debounce_work, btn3_poll_work), and a workqueue-only deadlock
+ * SYSTEM workqueue (debounce_work, btn_hold_work), and a workqueue-only deadlock
  * would leave that path dead while the main loop keeps petting the dog forever.
  * So a self-resubmitting work item bumps a heartbeat, and the main loop only pets
  * the watchdog when the heartbeat has advanced — making the dog prove BOTH the
@@ -331,11 +331,15 @@ static void backlight_init(void)
  * always comes back cleanly. Returns whether the screen is currently on. */
 static bool screen_on_state = true;
 
-/* True while front button #3 is held. Declared here (not with the other btn3
- * state) so screen_update() can keep the panel awake while the hold-to-reset/
- * bootloader hint is showing — otherwise, overnight, the hint would be drawn to a
- * blanked panel and never seen. */
-static volatile bool btn3_held;
+/* True while the staged hold on front button #1 is armed. Declared here (not with
+ * the rest of the hold state) so screen_update() can keep the panel awake while
+ * the hold-to-reset/bootloader hint is showing — otherwise, overnight, the hint
+ * would be drawn to a blanked panel and never seen.
+ * Cleared the instant the hold disarms — on release AND on the 10s cancel — so a
+ * physically stuck or chattering button can never pin the backlight on. (It used
+ * to stay set after a cancel, which defeated the overnight blank entirely and
+ * flattened the battery in about a day.) */
+static volatile bool btn_hold_armed;
 
 /* Set to 1 to test blank/re-init: screen off for the first 25 s, then on. */
 #define SCREEN_TEST 0
@@ -349,9 +353,9 @@ static bool screen_update(void)
 	bool on = (lm < 0) || (lm >= BL_ON_MIN && lm < BL_OFF_MIN);
 #endif
 
-	/* Keep the screen lit while #3 is held so the reset/bootloader hint is
+	/* Keep the screen lit while #1 is held so the reset/bootloader hint is
 	 * visible even overnight; it re-blanks on the next tick after release. */
-	if (btn3_held) {
+	if (btn_hold_armed) {
 		on = true;
 	}
 
@@ -396,91 +400,130 @@ static void btn_test_cb(uint8_t idx, bool pressed)
 	LOG_INF("BTN D%u %s", idx, pressed ? "DOWN" : "up");
 }
 #else
-/* Physical buttons: #1 (D1) and #2 (D2) are unassigned for now. #3 (D0) is a
- * deliberately-staged hold (it's a sensitive button, so a tap does nothing):
+/* Physical buttons. #1 (D1) is a deliberately-staged hold (a tap does nothing, so
+ * it can't fire by accident):
  *   hold >= 3s, release < 6s  -> reset (clean reboot; also re-triggers a
  *                                companion resync since the clock is RAM-only)
  *   hold >= 6s, release < 10s -> enter the UF2 bootloader (GPREGRET 0x57)
- *   hold >= 10s               -> timer exits, nothing happens (escape hatch)
+ *   hold >= 10s               -> disarms, nothing happens (escape hatch)
  *   release < 3s              -> nothing
  * A poll timer runs while it's held: it advances the on-screen hint and trips
- * the 10s cancel. The action itself is chosen from the hold duration on release. */
-#define BTN3_RESET_MS   3000
-#define BTN3_BOOT_MS    6000
-#define BTN3_CANCEL_MS  10000
+ * the 10s cancel. The action itself is chosen from the hold duration on release.
+ *
+ * This lives on #1 rather than #3 because #3 (D0) failed physically. A flaky
+ * button on the staged hold is genuinely dangerous: a contact that closes for
+ * 6-10s and then opens hands itself a "release" in the bootloader window, and the
+ * board silently reboots into UF2 — dark panel, no BLE, dead buttons, until it is
+ * power-cycled. Keep this function on a button known to be good.
+ *
+ * #2 (D2) is unassigned on the schedule view. #1 + #2 together still launch the
+ * hidden game (#1 = GO, #2 = BACK in-game); entering the game disarms the staged
+ * hold, so the chord can't leave a reset pending behind it. #3 is now unassigned. */
+#define BTN_HOLD_IDX    0        /* which button carries the staged hold (#1/D1) */
+#define BTN_RESET_MS    3000
+#define BTN_BOOT_MS     6000
+#define BTN_CANCEL_MS   10000
+#define BTN_HINT_CLEAR_MS 2000   /* how long "Cancelled" stays on screen */
 
-static struct k_work_delayable btn3_poll_work;
-static volatile int64_t btn3_press_ms;
-static volatile int     btn3_hint;   /* feeds elron_ui_button_hint() from main loop */
-/* btn3_held is declared up by screen_update() so it can keep the panel awake. */
+static struct k_work_delayable btn_hold_work;
+static volatile int64_t btn_hold_start_ms;
+static volatile int     btn_hint;   /* feeds elron_ui_button_hint() from main loop */
+/* btn_hold_armed is declared up by screen_update() so it can keep the panel awake. */
 
-static void btn3_poll_fn(struct k_work *w)
+/* Disarm the staged hold and drop the hint. Safe to call when not armed. */
+static void btn_hold_disarm(void)
+{
+	btn_hold_armed = false;
+	k_work_cancel_delayable(&btn_hold_work);
+	btn_hint = 0;
+}
+
+static void btn_hold_poll_fn(struct k_work *w)
 {
 	ARG_UNUSED(w);
-	if (!btn3_held) {
+	if (!btn_hold_armed) {
+		/* Deferred clear of the "Cancelled" banner (scheduled below). */
+		btn_hint = 0;
 		return;
 	}
-	int64_t held = k_uptime_get() - btn3_press_ms;
-	if (held >= BTN3_CANCEL_MS) {
-		btn3_hint = 4;            /* "Cancelled" — release now does nothing */
-		return;                  /* stop polling: escape hatch tripped */
-	} else if (held >= BTN3_CANCEL_MS - 1000) {
-		btn3_hint = 5;           /* last second: release NOW or it cancels */
-	} else if (held >= BTN3_BOOT_MS) {
-		btn3_hint = 3;           /* bootloader armed */
-	} else if (held >= BTN3_RESET_MS) {
-		btn3_hint = 2;           /* reset armed; keep holding for bootloader */
+	int64_t held = k_uptime_get() - btn_hold_start_ms;
+	if (held >= BTN_CANCEL_MS) {
+		/* Escape hatch tripped. Fully disarm — including btn_hold_armed, so the
+		 * panel is free to blank again. A button stuck closed forever otherwise
+		 * held the backlight on indefinitely. Release is now a no-op. */
+		btn_hold_armed = false;
+		btn_hint = 4;            /* "Cancelled" */
+		k_work_reschedule(&btn_hold_work, K_MSEC(BTN_HINT_CLEAR_MS));
+		LOG_WRN("button #%d held >=%dms -> cancelled (stuck?)",
+			BTN_HOLD_IDX + 1, BTN_CANCEL_MS);
+		return;
+	} else if (held >= BTN_CANCEL_MS - 1000) {
+		btn_hint = 5;            /* last second: release NOW or it cancels */
+	} else if (held >= BTN_BOOT_MS) {
+		btn_hint = 3;            /* bootloader armed */
+	} else if (held >= BTN_RESET_MS) {
+		btn_hint = 2;            /* reset armed; keep holding for bootloader */
 	} else {
-		btn3_hint = 1;           /* "Hold 3s for reset" */
+		btn_hint = 1;            /* "Hold 3s for reset" */
 	}
-	k_work_reschedule(&btn3_poll_work, K_MSEC(100));
+	k_work_reschedule(&btn_hold_work, K_MSEC(100));
 }
 
 static void btn_cb(uint8_t idx, bool pressed)
 {
-	if (idx == 2) {   /* #3 = staged hold: reset / bootloader / cancel */
-		if (pressed) {
-			btn3_press_ms = k_uptime_get();
-			btn3_held = true;
-			btn3_hint = 1;
-			k_work_reschedule(&btn3_poll_work, K_NO_WAIT);
-			return;
-		}
-		/* Released: stop polling, clear hint, act on how long it was held. */
-		btn3_held = false;
-		k_work_cancel_delayable(&btn3_poll_work);
-		int64_t held = k_uptime_get() - btn3_press_ms;
-		btn3_hint = 0;
-		if (held >= BTN3_CANCEL_MS) {
-			LOG_INF("button #3 held >=10s -> cancelled");
-		} else if (held >= BTN3_BOOT_MS) {
-			LOG_INF("button #3 held %lldms -> UF2 bootloader", held);
-			nrf_power_gpregret_set(NRF_POWER, 0, ADAFRUIT_UF2_MAGIC);
-			watchdog_feed();   /* hand the bootloader a full WDT window */
-			k_sleep(K_MSEC(50));
-			sys_reboot(SYS_REBOOT_COLD);
-		} else if (held >= BTN3_RESET_MS) {
-			LOG_INF("button #3 held %lldms -> reboot", held);
-			k_sleep(K_MSEC(50));
-			sys_reboot(SYS_REBOOT_COLD);
-		} else {
-			LOG_INF("button #3 tapped (%lldms) -> ignored", held);
+	/* In the game, #1/#2 are just controls — the staged hold stays out of the way
+	 * so a jump (tap on #1) can never arm a reset. */
+	if (elron_game_active()) {
+		if (idx == 0 || idx == 1) {
+			elron_game_button(idx, pressed);
 		}
 		return;
 	}
 
-	/* #1 / #2: in-game controls, or the entry chord from the schedule view. */
-	if (elron_game_active()) {
-		elron_game_button(idx, pressed);
+	/* Entry chord: #1 + #2 down together. Checked before the staged hold acts on
+	 * a release, and it abandons any hold already in progress on #1. */
+	if (pressed && (idx == 0 || idx == 1)) {
+		uint32_t st = elron_buttons_state();
+		if ((st & BIT(0)) && (st & BIT(1))) {
+			btn_hold_disarm();
+			elron_game_enter();
+			return;
+		}
+	}
+
+	if (idx == BTN_HOLD_IDX) {   /* #1 = staged hold: reset / bootloader / cancel */
+		if (pressed) {
+			btn_hold_start_ms = k_uptime_get();
+			btn_hold_armed = true;
+			btn_hint = 1;
+			k_work_reschedule(&btn_hold_work, K_NO_WAIT);
+			return;
+		}
+		/* Released. If the hold already disarmed (10s cancel, or the game chord
+		 * took it), this release means nothing. */
+		if (!btn_hold_armed) {
+			return;
+		}
+		int64_t held = k_uptime_get() - btn_hold_start_ms;
+		btn_hold_disarm();
+		if (held >= BTN_BOOT_MS) {
+			LOG_INF("button #1 held %lldms -> UF2 bootloader", held);
+			nrf_power_gpregret_set(NRF_POWER, 0, ADAFRUIT_UF2_MAGIC);
+			watchdog_feed();   /* hand the bootloader a full WDT window */
+			k_sleep(K_MSEC(50));
+			sys_reboot(SYS_REBOOT_COLD);
+		} else if (held >= BTN_RESET_MS) {
+			LOG_INF("button #1 held %lldms -> reboot", held);
+			k_sleep(K_MSEC(50));
+			sys_reboot(SYS_REBOOT_COLD);
+		} else {
+			LOG_INF("button #1 tapped (%lldms) -> ignored", held);
+		}
 		return;
 	}
+
 	if (pressed) {
-		uint32_t st = elron_buttons_state();
-		if ((st & BIT(0)) && (st & BIT(1))) {   /* #1 + #2 held -> launch */
-			elron_game_enter();
-		} else {
-			LOG_INF("button #%u (%s) pressed", idx + 1, elron_button_name[idx]);
-		}
+		LOG_INF("button #%u (%s) pressed", idx + 1, elron_button_name[idx]);
 	}
 }
 #endif
@@ -737,7 +780,7 @@ int main(void)
 	}
 
 #if !BUTTON_TEST
-	k_work_init_delayable(&btn3_poll_work, btn3_poll_fn);
+	k_work_init_delayable(&btn_hold_work, btn_hold_poll_fn);
 	if (elron_buttons_init(btn_cb)) {
 		LOG_ERR("buttons init failed");
 	}
@@ -762,8 +805,8 @@ int main(void)
 		}
 #if !BUTTON_TEST
 		/* Live hold-to-reset/bootloader hint (cheap; only redraws on change). */
-		elron_ui_button_hint(btn3_hint);
-		if (btn3_held) {
+		elron_ui_button_hint(btn_hint);
+		if (btn_hold_armed) {
 			if (!screen_on_state) {
 				/* Wake the panel right away so the hint is visible even when the
 				 * screen is blanked (overnight). screen_update() keeps it lit
