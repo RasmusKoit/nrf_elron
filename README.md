@@ -22,7 +22,7 @@ the board persists them to flash and runs offline on battery.
 
 ## Layout
 
-- `boards/xiao_ble.overlay` — ST7789 on SPI3 + GPIO backlight; disables the board
+- `boards/xiao_ble.overlay` — ST7789 on SPI3 + PWM-dimmed backlight; disables the board
   peripherals (`i2c1`/`spi2`/`uart0`) that otherwise squat on the display pins.
 - `prj.conf`, `CMakeLists.txt`, `src/` — the Zephyr/NCS firmware.
 - `src/buttons.c` — three front-panel buttons (debounced); one is a staged
@@ -93,7 +93,7 @@ Three front-panel buttons on the XIAO header — D0/D1/D2 as inputs sharing a co
 on D8 (the firmware drives it low; inputs use internal pull-ups), debounced in
 `src/buttons.c`.
 
-- **Reset / bootloader button** — a deliberately staged *hold*, so a tap does
+- **Button #1: reset / bootloader** — a deliberately staged *hold*, so a tap does
   nothing (it can't be triggered by accident). An on-screen banner shows the stage
   as you hold:
   - hold ~3 s, release → **reset** (clean reboot; also re-syncs, since the clock
@@ -102,13 +102,16 @@ on D8 (the firmware drives it low; inputs use internal pull-ups), debounced in
     hardware DFU trigger, so you can reflash without the 1200-baud serial touch
   - hold past 10 s → cancelled, nothing happens
 
-  Thresholds live in `src/main.c` (`BTN3_RESET_MS` / `BTN3_BOOT_MS` /
-  `BTN3_CANCEL_MS`).
-- **Buttons #1 and #2** — normally unused on the schedule view; **hold both at
-  once** to launch the hidden game, *"Catch the Train"* (a one-button endless
-  runner, `src/game.c`). In the game, **#1 = GO** (start / jump / replay) and
-  **#2 = BACK** (quit to the schedule). The high score persists in NVS; the
-  game-over screen auto-exits after 20 s.
+  Thresholds live in `src/main.c` (`BTN_RESET_MS` / `BTN_BOOT_MS` /
+  `BTN_CANCEL_MS`; `BTN_HOLD_IDX` picks the button).
+- **Buttons #1 + #2 together** — launch the hidden game, *"Catch the Train"* (a
+  one-button endless runner, `src/game.c`). In the game, **#1 = GO** (start / jump
+  / replay) and **#2 = BACK** (quit to the schedule). The high score persists in
+  NVS; the game-over screen auto-exits after 20 s and an untouched title screen
+  after 60 s. The game won't start while the battery is nearly empty.
+- **On battery**, a press of #1 or #2 also lights a blanked screen for 60 s (see
+  *On battery* under [How it works](#how-it-works)).
+- **Button #2** on its own and **button #3** are unassigned.
 
 ## How it works
 

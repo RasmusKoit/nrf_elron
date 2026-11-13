@@ -78,7 +78,7 @@ void elron_ui_init(void)
 	lv_obj_align(lbl_status, LV_ALIGN_BOTTOM_MID, 0, -4);
 	lv_label_set_text(lbl_status, "starting...");
 
-	/* Hold-to-reset/bootloader hint: centered banner, hidden until #3 is held. */
+	/* Hold-to-reset/bootloader hint: centered banner, hidden until #1 is held. */
 	lbl_hint = lv_label_create(scr);
 	style_label(lbl_hint, &lv_font_montserrat_24, COL_TEXT);
 	lv_obj_set_style_bg_color(lbl_hint, COL_ELRON, 0);
